@@ -2401,7 +2401,6 @@ static Bool style_parse_one_style_option(
 			ps->change_mask.use_border_colorset_handles_se = 1;
 
 			ps->change_mask.use_border_colorset_handles = 1;
-
                 }
 
 		else if (StrEquals(token, "BottomTitleRotated"))
@@ -3097,7 +3096,6 @@ static Bool style_parse_one_style_option(
 			ps->change_mask.use_border_colorset_hi_west = 1;
 
 			ps->change_mask.use_border_colorset_hi_regions = 1;
-
                 }
                 else if (StrEquals(token, "HilightHandlesColorsetRegions"))
                 {
@@ -3154,7 +3152,6 @@ static Bool style_parse_one_style_option(
 			ps->change_mask.use_border_colorset_hi_handles_se = 1;
 
 			ps->change_mask.use_border_colorset_hi_handles = 1;
-
                 }
                 else if (StrEquals(token, "HilightIconTitleColorset"))
 		{
