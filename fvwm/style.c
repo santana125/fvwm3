@@ -2343,6 +2343,8 @@ static Bool style_parse_one_style_option(
 			ps->flags.use_border_colorset_west = (f[3] >= 0);
 			ps->flag_mask.use_border_colorset_west = 1;
 			ps->change_mask.use_border_colorset_west = 1;
+
+			ps->change_mask.use_border_colorset_regions = 1;
                 }
                 else if (StrEquals(token, "BorderHandlesColorsetRegions"))
                 {
@@ -2397,6 +2399,8 @@ static Bool style_parse_one_style_option(
 			ps->flags.use_border_colorset_handles_se = (f[3] >= 0);
 			ps->flag_mask.use_border_colorset_handles_se = 1;
 			ps->change_mask.use_border_colorset_handles_se = 1;
+
+			ps->change_mask.use_border_colorset_handles = 1;
 
                 }
 
@@ -3092,6 +3096,8 @@ static Bool style_parse_one_style_option(
 			ps->flag_mask.use_border_colorset_hi_west = 1;
 			ps->change_mask.use_border_colorset_hi_west = 1;
 
+			ps->change_mask.use_border_colorset_hi_regions = 1;
+
                 }
                 else if (StrEquals(token, "HilightHandlesColorsetRegions"))
                 {
@@ -3146,6 +3152,8 @@ static Bool style_parse_one_style_option(
 			ps->flags.use_border_colorset_hi_handles_se = (f[3] >= 0);
 			ps->flag_mask.use_border_colorset_hi_handles_se = 1;
 			ps->change_mask.use_border_colorset_hi_handles_se = 1;
+
+			ps->change_mask.use_border_colorset_hi_handles = 1;
 
                 }
                 else if (StrEquals(token, "HilightIconTitleColorset"))
@@ -5346,7 +5354,9 @@ void check_window_style_change(
 	if (ret_style->change_mask.has_color_fore ||
 	    ret_style->change_mask.has_color_back ||
 	    ret_style->change_mask.use_colorset ||
-	    ret_style->change_mask.use_border_colorset)
+	    ret_style->change_mask.use_border_colorset ||
+	    ret_style->change_mask.use_border_colorset_regions ||
+	    ret_style->change_mask.use_border_colorset_handles)
 	{
 		flags->do_update_window_color = 1;
 	}
@@ -5357,7 +5367,9 @@ void check_window_style_change(
 	if (ret_style->change_mask.has_color_fore_hi ||
 	    ret_style->change_mask.has_color_back_hi ||
 	    ret_style->change_mask.use_colorset_hi ||
-	    ret_style->change_mask.use_border_colorset_hi)
+	    ret_style->change_mask.use_border_colorset_hi ||
+	    ret_style->change_mask.use_border_colorset_hi_regions ||
+	    ret_style->change_mask.use_border_colorset_hi_handles)
 	{
 		flags->do_update_window_color_hi = 1;
 	}
