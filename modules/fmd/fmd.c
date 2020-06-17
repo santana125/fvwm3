@@ -38,6 +38,8 @@ struct event fvwm_read, fvwm_write;
 static ModuleArgs *module;
 static int fvwm_fd[2];
 
+struct buffer;
+
 static int setnonblock(int);
 
 static void on_client_read(int, short, void *);
@@ -48,6 +50,7 @@ static void on_fvwm_read(int, short, void *);
 static void on_fvwm_write(int, short, void *);
 
 static void broadcast_to_client(unsigned long);
+static int write_to_fd(int, struct event *, struct buffer *);
 
 static void setup_signal_handlers(void);
 static RETSIGTYPE HandleTerminate(int sig);
@@ -94,7 +97,8 @@ struct client {
 	u_int		flags;
 
 	TAILQ_ENTRY(client)  entry;
-	TAILQ_HEAD(, buffer) writeq;
+	TAILQ_HEAD(, buffer) c_writeq;
+	TAILQ_HEAD(, buffer) f_writeq;
 };
 TAILQ_HEAD(clients, client);
 struct clients	clientq;
@@ -121,6 +125,35 @@ setnonblock(int fd)
 	return (0);
 }
 
+static int
+write_to_fd(int fd, struct event *e, struct buffer *bufferq)
+{
+	int		 len;
+
+	/* Write the buffer.  A portion of the buffer may have been
+	 * written in a previous write, so only write the remaining
+	 * bytes.
+	 */
+
+	len = bufferq->len - bufferq->offset;
+	len = write(fd, bufferq->buf + bufferq->offset,
+			bufferq->len - bufferq->offset);
+	if (len == -1) {
+		if (errno == EINTR || errno == EAGAIN) {
+			/* Write failed. */
+			event_add(e, NULL);
+			return (-1);
+		} else
+			err(1, "write failed");
+	} else if ((bufferq->offset + len) < bufferq->len) {
+		/* Incomplete write - reschedule. */
+		bufferq->offset += len;
+		event_add(e, NULL);
+		return (-1);
+	}
+	return (0);
+}
+
 static void
 broadcast_to_client(unsigned long type)
 {
@@ -137,7 +170,7 @@ broadcast_to_client(unsigned long type)
 		bufferq->len = strlen(buf);
 		bufferq->buf = fxstrdup(buf);
 		bufferq->offset = 0;
-		TAILQ_INSERT_TAIL(&c->writeq, bufferq, entries);
+		TAILQ_INSERT_TAIL(&c->c_writeq, bufferq, entries);
 
 		free(buf);
 
@@ -155,7 +188,7 @@ on_fvwm_read(int fd, short ev, void *arg)
 		close(fd);
 		event_del(&fvwm_read);
 
-		exit(1);
+		HandleTerminate(0);
 	}
 
 	switch(packet->type) {
@@ -171,13 +204,27 @@ on_fvwm_read(int fd, short ev, void *arg)
 static void
 on_fvwm_write(int fd, short ev, void *arg)
 {
-	return;
+	struct client 	*c = (struct client *)arg;
+	struct buffer	*b;
+
+	if (c == NULL)
+		return;
+
+	b = TAILQ_FIRST(&c->f_writeq);
+
+	if (b != NULL && (write_to_fd(fd, &fvwm_write, b)) == 0) {
+		/* Write complete.  Remove from the buffer. */
+		TAILQ_REMOVE(&c->f_writeq, b, entries);
+		free(b->buf);
+		free(b);
+	}
 }
 
 static void
 on_client_read(int fd, short ev, void *arg)
 {
 	struct client 	*client = (struct client *)arg;
+	struct buffer	*bufferq;
 	char		*buf;
 	int		 len;
 
@@ -202,48 +249,41 @@ on_client_read(int fd, short ev, void *arg)
 		return;
 	}
 
-	if (strcmp(buf, "set new_window") == 0)
+	if (strcmp(buf, "set new_window") == 0) {
 		client->flags |= M_ADD_WINDOW;
 
+		return;
+	}
+
+	/* Anything else is sent through to FVWM3. */
+	bufferq = fxcalloc(1, sizeof(*bufferq));
+	bufferq->len = strlen(buf);
+	bufferq->buf = fxstrdup(buf);
+	bufferq->offset = 0;
+	TAILQ_INSERT_TAIL(&client->f_writeq, bufferq, entries);
+
 	free(buf);
+
+	event_add(&fvwm_write, NULL);
 }
 
 static void
 on_client_write(int fd, short ev, void *arg)
 {
-	struct client	*client = (struct client *)arg;
-	struct buffer	*bufferq;
-	int		 len;
+	struct client	*c = (struct client *)arg;
+	struct buffer	*b;
 
-	if ((bufferq = TAILQ_FIRST(&client->writeq)) == NULL)
+	if (c == NULL)
 		return;
 
-	/* Write the buffer.  A portion of the buffer may have been
-	 * written in a previous write, so only write the remaining
-	 * bytes.
-	 */
+	b = TAILQ_FIRST(&c->c_writeq);
 
-	len = bufferq->len - bufferq->offset;
-	len = write(fd, bufferq->buf + bufferq->offset,
-			bufferq->len - bufferq->offset);
-	if (len == -1) {
-		if (errno == EINTR || errno == EAGAIN) {
-			/* Write failed. */
-			event_add(&client->write, NULL);
-			return;
-		} else
-			err(1, "write failed");
-	} else if ((bufferq->offset + len) < bufferq->len) {
-		/* Incomplete write - reschedule. */
-		bufferq->offset += len;
-		event_add(&client->write, NULL);
-		return;
+	if (b != NULL && (write_to_fd(fd, &c->write, b)) == 0) {
+		/* Write complete.  Remove from the buffer. */
+		TAILQ_REMOVE(&c->c_writeq, b, entries);
+		free(b->buf);
+		free(b);
 	}
-
-	/* Write complete.  Remove from the buffer. */
-	TAILQ_REMOVE(&client->writeq, bufferq, entries);
-	free(bufferq->buf);
-	free(bufferq);
 }
 
 static void
@@ -276,8 +316,10 @@ on_client_accept(int fd, short ev, void *arg)
 	 * want to make it active yet via event_add() until we're ready.
 	 */
 	event_set(&client->write, client_fd, EV_WRITE, on_client_write, client);
+	event_set(&fvwm_write, fvwm_fd[0], EV_WRITE, on_fvwm_write, client);
 
-	TAILQ_INIT(&client->writeq);
+	TAILQ_INIT(&client->c_writeq);
+	TAILQ_INIT(&client->f_writeq);
 	TAILQ_INSERT_TAIL(&clientq, client, entry);
 
 	fprintf(stderr, "Accepted connection...\n");
@@ -309,8 +351,6 @@ main(int argc, char **argv)
 	 */
 	event_set(&fvwm_read, fvwm_fd[1], EV_READ|EV_PERSIST, on_fvwm_read, NULL);
 	event_add(&fvwm_read, NULL);
-
-	event_set(&fvwm_write, fvwm_fd[0], EV_WRITE, on_fvwm_write, NULL);
 
 	SendFinishedStartupNotification(fvwm_fd);
 	SetSyncMask(fvwm_fd, M_ADD_WINDOW);
