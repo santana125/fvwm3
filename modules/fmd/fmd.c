@@ -8,55 +8,52 @@
 
 #include "config.h"
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/time.h>
-
-#include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <string.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <err.h>
-#include <signal.h>
-#include <stdbool.h>
-
-#include <bson.h>
-#include <event.h>
-
 #include "libs/Module.h"
 #include "libs/safemalloc.h"
 #include "libs/queue.h"
 #include "libs/fvwmsignal.h"
 
-#define SOCKET_PATH "/tmp/fvwm_fmd.sock"
-#define BUFLEN 1024
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/time.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <err.h>
+#include <errno.h>
+#include <stdbool.h>
+
+#include <event2/event.h>
+#include <event2/event_struct.h>
+#include <event2/buffer.h>
+#include <event2/bufferevent.h>
+#include <event2/bufferevent_compat.h>
+#include <event2/listener.h>
+
+#define SOCK "/tmp/fvwm_fmd.sock"
 
 const char *myname = "fmd";
-struct event fvwm_read, fvwm_write;
-static ModuleArgs *module;
-static int fvwm_fd[2];
+static int debug;
 
-struct buffer;
-struct client;
+struct client {
+	struct bufferevent	*comms;
+	int			 flags;
 
-static int setnonblock(int);
+	TAILQ_ENTRY(client)	 entry;
+};
 
-static void on_client_read(int, short, void *);
-static void on_client_write(int, short, void *);
-static void on_client_accept(int, short, void *);
+TAILQ_HEAD(clients, client);
+struct clients  clientq;
 
-static void on_fvwm_read(int, short, void *);
-static void on_fvwm_write(int, short, void *);
+struct fvwm_comms {
+	int		 fd[2];
+	struct event	*read_ev;
+	ModuleArgs	*m;
+};
 
-static void broadcast_to_client(unsigned long);
-static int write_to_fd(int, struct event *, struct buffer *);
-
-static void setup_signal_handlers(void);
-static RETSIGTYPE HandleTerminate(int sig);
-
-static int client_set_interest(struct client *, const char *);
+struct fvwm_comms	 fc;
 
 struct event_flag {
 	const char	*event;
@@ -84,18 +81,12 @@ struct event_flag {
 	{"restack", M_RESTACK},
 };
 
-static inline const char *
-flag_to_event(int flag)
-{
-	size_t	 i;
 
-	for (i = 0; i < (sizeof(etf) / sizeof(etf[0])); i++) {
-		if (etf[i].flag & flag)
-			return (etf[i].event);
-	}
-
-	return (NULL);
-}
+static void fvwm_read(int, short, void *);
+static void broadcast_to_client(unsigned long);
+static void setup_signal_handlers(void);
+static RETSIGTYPE HandleTerminate(int sig);
+static int client_set_interest(struct client *, const char *);
 
 static RETSIGTYPE
 HandleTerminate(int sig)
@@ -113,7 +104,7 @@ setup_signal_handlers(void)
     sigemptyset(&sigact.sa_mask);
     sigaddset(&sigact.sa_mask, SIGTERM);
     sigaddset(&sigact.sa_mask, SIGINT);
-    sigaddset(&sigact.sa_mask, SIGPIPE);
+    //sigaddset(&sigact.sa_mask, SIGPIPE);
 #ifdef SA_INTERRUPT
     sigact.sa_flags = SA_INTERRUPT; /* to interrupt ReadFvwmPacket() */
 #else
@@ -134,129 +125,32 @@ setup_signal_handlers(void)
 #endif
 }
 
-struct client {
-	struct event	read, write;
-	u_int		flags;
+static inline const char *
+flag_to_event(int flag)
+{
+	size_t	 i;
 
-	TAILQ_ENTRY(client)  entry;
-	TAILQ_HEAD(, buffer) c_writeq;
-	TAILQ_HEAD(, buffer) f_writeq;
-};
-TAILQ_HEAD(clients, client);
-struct clients	clientq;
+	for (i = 0; i < (sizeof(etf) / sizeof(etf[0])); i++) {
+		if (etf[i].flag & flag)
+			return (etf[i].event);
+	}
 
-struct buffer {
-	int 	 offset, len;
-	char 	*buf;
-
-	TAILQ_ENTRY(buffer) entries;
-};
+	return (NULL);
+}
 
 static int
 setnonblock(int fd)
 {
-	int flags;
+        int flags;
 
-	if ((flags = fcntl(fd, F_GETFL)) < 0)
-		return (flags);
+        if ((flags = fcntl(fd, F_GETFL)) < 0)
+                return (flags);
 
-	flags |= O_NONBLOCK;
-	if (fcntl(fd, F_SETFL, flags) < 0)
-		return (-1);
+        flags |= O_NONBLOCK;
+        if (fcntl(fd, F_SETFL, flags) < 0)
+                return (-1);
 
-	return (0);
-}
-
-static int
-write_to_fd(int fd, struct event *e, struct buffer *bufferq)
-{
-	int		 len;
-
-	/* Write the buffer.  A portion of the buffer may have been
-	 * written in a previous write, so only write the remaining
-	 * bytes.
-	 */
-
-	len = bufferq->len - bufferq->offset;
-	len = write(fd, bufferq->buf + bufferq->offset,
-			bufferq->len - bufferq->offset);
-	if (len == -1) {
-		if (errno == EINTR || errno == EAGAIN) {
-			/* Write failed. */
-			event_add(e, NULL);
-			return (-1);
-		} else
-			err(1, "write failed");
-	} else if ((bufferq->offset + len) < bufferq->len) {
-		/* Incomplete write - reschedule. */
-		bufferq->offset += len;
-		event_add(e, NULL);
-		return (-1);
-	}
-	return (0);
-}
-
-static void
-broadcast_to_client(unsigned long type)
-{
-	struct client	*c;
-	struct buffer 	*bufferq;
-	char 		*buf;
-
-	TAILQ_FOREACH(c, &clientq, entry) {
-		if (!(c->flags & type))
-			continue;
-		asprintf(&buf, "Reacting to: %s", flag_to_event(type));
-
-		bufferq = fxmalloc(sizeof(*bufferq));
-		bufferq->len = strlen(buf);
-		bufferq->buf = fxstrdup(buf);
-		bufferq->offset = 0;
-		TAILQ_INSERT_TAIL(&c->c_writeq, bufferq, entries);
-
-		free(buf);
-
-		event_add(&c->write, NULL);
-	}
-}
-
-static void
-on_fvwm_read(int fd, short ev, void *arg)
-{
-	FvwmPacket	*packet;
-
-	if ((packet = ReadFvwmPacket(fd)) == NULL) {
-		fprintf(stderr, "Couldn't read from FVWM - exiting.\n");
-		goto done;
-	}
-
-	broadcast_to_client(packet->type);
-done:
-	SendUnlockNotification(fvwm_fd);
-}
-
-static void
-on_fvwm_write(int fd, short ev, void *arg)
-{
-	struct client 	*c = (struct client *)arg;
-	struct buffer	*b;
-
-	if (c == NULL) {
-		fprintf(stderr, "%s: not continuing.  Client is NULL\n", __func__);
-		return;
-	}
-
-	TAILQ_FOREACH(b, &c->f_writeq, entries) {
-		fprintf(stderr, "Sent: <<%s>>\n", b->buf);
-		SendText(fvwm_fd, b->buf, 0);
-	}
-
-	TAILQ_FOREACH(b, &c->f_writeq, entries) {
-		/* Write complete.  Remove from the buffer. */
-		TAILQ_REMOVE(&c->f_writeq, b, entries);
-		free(b->buf);
-		free(b);
-	}
+        return (0);
 }
 
 static inline bool
@@ -272,7 +166,7 @@ static int
 client_set_interest(struct client *c, const char *event)
 {
 	size_t		i;
-	int		flag_type;
+	int		flag_type = 0;
 	bool		changed = false;
 #define PRESET "set"
 #define PREUNSET "unset"
@@ -285,6 +179,14 @@ client_set_interest(struct client *c, const char *event)
 		flag_type = EFLAGUNSET;
 	}
 
+	if (strcmp(event, "debug") == 0) {
+		debug = (flag_type == EFLAGSET) ? 1 : 0;
+
+		/* Never send to FVWM3. */
+		return (true);
+	}
+
+
 	for (i = 0; i < (sizeof(etf) / sizeof(etf[0])); i++) {
 		if (strcmp(etf[i].event, event) == 0) {
 			changed = true;
@@ -295,179 +197,193 @@ client_set_interest(struct client *c, const char *event)
 		}
 	}
 
+	SetSyncMask(fc.fd, c->flags);
+
 	return (changed);
 }
 
 static void
-on_client_read(int fd, short ev, void *arg)
+broadcast_to_client(unsigned long type)
 {
-	struct client 	*client = (struct client *)arg;
-	struct buffer	*bufferq, *b;
-	char		*buf;
-	int		 len;
+	struct client	*c;
+	char 		*buf;
 
-	buf = fxmalloc(BUFLEN);
+	TAILQ_FOREACH(c, &clientq, entry) {
+		if (!(c->flags & type))
+			continue;
+		asprintf(&buf, "Reacting to: %s", flag_to_event(type));
 
-	if ((len = read(fd, buf, BUFLEN)) <= 0) {
+		bufferevent_write(c->comms, buf, strlen(buf));
 		free(buf);
-		fprintf(stderr, "client disconnected.\n");
-		close(fd);
-		event_del(&client->read);
-		TAILQ_REMOVE(&clientq, client, entry);
-
-		TAILQ_FOREACH(b, &client->f_writeq, entries) {
-			TAILQ_REMOVE(&client->f_writeq, b, entries);
-			free(b->buf);
-			free(b);
-		}
-		free(client);
-		return;
 	}
+}
+
+static void
+client_read_cb(struct bufferevent *bev, void *ctx)
+{
+	struct evbuffer	*input = bufferevent_get_input(bev);
+	struct client	*c = (struct client *)ctx;
+	size_t		 len = evbuffer_get_length(input);
+	char		 *data = fxmalloc(len);
+
+	evbuffer_copyout(input, data, len);
 
 	/* Remove the newline if there is one. */
-	if (buf[strlen(buf) - 1] == '\n')
-		buf[strlen(buf) - 1] = '\0';
+	if (data[strlen(data) - 1] == '\n')
+		data[strlen(data) - 1] = '\0';
 
-	if (*buf == '\0') {
-		free(buf);
-		return;
+	if (*data == '\0')
+		goto out;
+
+	if (client_set_interest(c, data)) {
+		goto out;
 	}
 
-	if (client_set_interest(client, buf))
-		return;
+	SendText(fc.fd, data, 0);
 
-	/* Anything else is sent through to FVWM3. */
-	bufferq = fxcalloc(1, sizeof(*bufferq));
-	bufferq->len = strlen(buf);
-	bufferq->buf = fxstrdup(buf);
-	bufferq->offset = 0;
-	TAILQ_INSERT_TAIL(&client->f_writeq, bufferq, entries);
-
-	free(buf);
-
-	event_del(&fvwm_write);
-	event_set(&fvwm_write, fvwm_fd[0], EV_WRITE, on_fvwm_write, client);
-	event_add(&fvwm_write, NULL);
+out:
+	free(data);
+	evbuffer_drain(input, len);
 }
 
 static void
-on_client_write(int fd, short ev, void *arg)
+client_write_cb(struct bufferevent *bev, void *ctx)
 {
-	struct client	*c = (struct client *)arg;
-	struct buffer	*b;
+	struct client	*c = ctx;
 
-	if (c == NULL)
-		return;
+	if (debug)
+		fprintf(stderr, "Writing... (client %p)...\n", c);
+}
 
-	b = TAILQ_FIRST(&c->c_writeq);
+static void client_err_cb(struct bufferevent *bev, short events, void *ctx)
+{
+	struct client	*c = (struct client *)ctx, *clook;
 
-	if (b != NULL && (write_to_fd(fd, &c->write, b)) == 0) {
-		/* Write complete.  Remove from the buffer. */
-		TAILQ_REMOVE(&c->c_writeq, b, entries);
-		free(b->buf);
-		free(b);
+	if (events & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
+		TAILQ_FOREACH(clook, &clientq, entry) {
+			if (c == clook) {
+				TAILQ_REMOVE(&clientq, c, entry);
+				bufferevent_free(bev);
+			}
+		}
 	}
+}
+
+
+static void
+accept_conn_cb(struct evconnlistener *l, evutil_socket_t fd,
+		struct sockaddr *add, int socklen, void *ctx)
+{
+	/* We got a new connection! Set up a bufferevent for it. */
+	struct client		*c;
+	struct event_base	*base = evconnlistener_get_base(l);
+
+	c = fxmalloc(sizeof *c);
+
+	c->comms = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+
+	bufferevent_setcb(c->comms, client_read_cb, client_write_cb,
+	    client_err_cb, c);
+	bufferevent_enable(c->comms, EV_READ|EV_WRITE|EV_PERSIST);
+
+	TAILQ_INSERT_TAIL(&clientq, c, entry);
+}
+
+static void accept_error_cb(struct evconnlistener *listener, void *ctx)
+{
+	struct event_base *base = evconnlistener_get_base(listener);
+	int err = EVUTIL_SOCKET_ERROR();
+	fprintf(stderr, "Got an error %d (%s) on the listener. "
+		"Shutting down.\n", err, evutil_socket_error_to_string(err));
+
+	event_base_loopexit(base, NULL);
 }
 
 static void
-on_client_accept(int fd, short ev, void *arg)
+signal_cb(evutil_socket_t sig, short events, void *user_data)
 {
-	struct sockaddr_in 	 client_addr;
-	struct client 		*client;
-	socklen_t 		 client_len = sizeof(client_addr);
-	int 			 client_fd;
+	struct event_base *base = user_data;
+	struct timeval delay = { 1, 0 };
 
-	/* Accept the new connection. */
-	client_fd = accept(fd, (struct sockaddr *)&client_addr, &client_len);
-	if (client_fd == -1) {
-		fprintf(stderr, "accept failed: %s", strerror(errno));
-		return;
-	}
-
-	if (setnonblock(client_fd) < 0)
-		fprintf(stderr, "couldn't make socket non-blocking\n");
-
-	client = fxmalloc(sizeof(*client));
-
-	event_set(&client->read, client_fd, EV_READ|EV_PERSIST, on_client_read,
-	    client);
-
-	/* Make the event active, by adding it. */
-	event_add(&client->read, NULL);
-
-	/* Setting the event here makes libevent aware of it, but we don't
-	 * want to make it active yet via event_add() until we're ready.
-	 */
-	event_set(&client->write, client_fd, EV_WRITE, on_client_write, client);
-	event_set(&fvwm_write, fvwm_fd[0], EV_WRITE, on_fvwm_write, client);
-
-	TAILQ_INIT(&client->c_writeq);
-	TAILQ_INIT(&client->f_writeq);
-	TAILQ_INSERT_TAIL(&clientq, client, entry);
-
-	event_add(&fvwm_write, NULL);
-
-	fprintf(stderr, "Accepted connection...\n");
+	unlink(SOCK);
+	event_base_loopexit(base, &delay);
 }
 
-int
-main(int argc, char **argv)
+static void
+fvwm_read(int efd, short ev, void *data)
 {
-	struct sockaddr_un addr;
-	struct event ev_accept;
-	int fd;
+	FvwmPacket	*packet;
 
-	if ((module = ParseModuleArgs(argc, argv, 1)) == NULL) {
-		fprintf(stderr, "%s must be started by FVWM3\n", myname);
-		exit(1);
+	SendUnlockNotification(fc.fd);
+
+	if ((packet = ReadFvwmPacket(efd)) == NULL) {
+		if (debug)
+			fprintf(stderr, "Couldn't read from FVWM - exiting.\n");
+		exit(0);
 	}
 
-	setup_signal_handlers();
+	broadcast_to_client(packet->type);
+}
 
-	fvwm_fd[0] = module->to_fvwm;
-	fvwm_fd[1] = module->from_fvwm;
-
-	event_init();
+int main(int argc, char **argv)
+{
+	struct event_base     *base;
+	struct evconnlistener *fmd_cfd;
+	struct event          *signal_event;
+	struct sockaddr_un    sin;
 
 	TAILQ_INIT(&clientq);
 
-	/* Set up the read/write listeners as early as possible, as there's
-	 * every chance FVWM will send us information as soon as we start up.
-	 */
-	if (setnonblock(fvwm_fd[0]) < 0)
-		err(1, "fvwm to_fvwm socket non-blocking failed");
-	if (setnonblock(fvwm_fd[1]) < 0)
-		err(1, "fvwm from_fvwm socket non-blocking failed");
+	setup_signal_handlers();
 
-	event_set(&fvwm_read, fvwm_fd[1], EV_READ|EV_PERSIST, on_fvwm_read, NULL);
-	event_add(&fvwm_read, NULL);
+	if ((fc.m = ParseModuleArgs(argc, argv, 1)) == NULL) {
+		fprintf(stderr, "%s must be started by FVWM3\n", myname);
+		return (1);
+	}
 
-	SendFinishedStartupNotification(fvwm_fd);
-	SetSyncMask(fvwm_fd, M_ADD_WINDOW);
+	/* Create new event base */
+	if ((base = event_base_new()) == NULL) {
+		fprintf(stderr, "Couldn't start libevent\n");
+		return (1);
+	}
 
-	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
-		err(1, "listen failed");
+	unlink(SOCK);
 
-	memset(&addr, 0, sizeof(addr));
-	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+	memset(&sin, 0, sizeof(sin));
+	sin.sun_family = AF_LOCAL;
+	strcpy(sin.sun_path, SOCK);
 
-	if (unlink(addr.sun_path) != 0 && errno != ENOENT)
-		err(1, "unlink failed");
+	/* Create a new listener */
+	fmd_cfd = evconnlistener_new_bind(base, accept_conn_cb, NULL,
+		  LEV_OPT_CLOSE_ON_FREE, -1,
+		  (struct sockaddr *)&sin, sizeof(sin));
+	if (fmd_cfd == NULL) {
+		perror("Couldn't create listener");
+		return 1;
+	}
+	evconnlistener_set_error_cb(fmd_cfd, accept_error_cb);
 
-	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-		err(1, "bind failed");
-	if (listen(fd, 1024) < 0)
-		err(1, "listen failed");
-	if (setnonblock(fd) < 0)
-		err(1, "server socket non-blocking failed");
+	signal_event = evsignal_new(base, SIGPIPE, signal_cb, (void *)base);
+	if (signal_event == NULL || event_add(signal_event, NULL) < 0) {
+		fprintf(stderr, "Could not create/add a signal event\n");
+		return (1);
+	}
 
-	event_set(&ev_accept, fd, EV_READ|EV_PERSIST, on_client_accept, NULL);
-	event_add(&ev_accept, NULL);
+	/* Setup comms to fvwm3. */
+	fc.fd[0] = fc.m->to_fvwm;
+	fc.fd[1] = fc.m->from_fvwm;
 
-	fprintf(stderr, "Started.  Waiting for connections...\n");
+	if (setnonblock(fc.fd[0]) < 0)
+		fprintf(stderr, "fvwm to_fvwm socket non-blocking failed");
+	if (setnonblock(fc.fd[1]) < 0)
+		fprintf(stderr, "fvwm to_fvwm socket non-blocking failed");
 
-	event_dispatch();
+	fc.read_ev = event_new(base, fc.fd[1], EV_READ|EV_PERSIST, fvwm_read, NULL);
+	event_add(fc.read_ev, NULL);
+
+	SendFinishedStartupNotification(fc.fd);
+
+	event_base_dispatch(base);
 
 	return (0);
 }
