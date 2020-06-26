@@ -1,5 +1,6 @@
 language: c
 sudo: false
+dist: bionic
 branches:
         except:
                 - todo
@@ -39,7 +40,7 @@ addons:
                     - libxt-dev
                     - sharutils
                     - xsltproc
-script: (./autogen.sh && CFLAGS= ./configure) && make
+script: (./autogen.sh && CFLAGS= ./configure --disable-silent-rules) && make
 notifications:
         irc:
                 channels:

@@ -8,10 +8,13 @@
 
 #include "config.h"
 
+#include "fvwm/fvwm.h"
+
 #include "libs/Module.h"
 #include "libs/safemalloc.h"
 #include "libs/queue.h"
 #include "libs/fvwmsignal.h"
+#include "libs/vpacket.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -25,6 +28,8 @@
 #include <errno.h>
 #include <stdbool.h>
 
+#include <bson/bson.h>
+
 #include <event2/event.h>
 #include <event2/event_struct.h>
 #include <event2/buffer.h>
@@ -32,6 +37,7 @@
 #include <event2/bufferevent_compat.h>
 #include <event2/listener.h>
 
+/* XXX - should also be configurable via getenv() */
 #define SOCK "/tmp/fvwm_fmd.sock"
 
 const char *myname = "fmd";
@@ -83,16 +89,17 @@ struct event_flag {
 
 
 static void fvwm_read(int, short, void *);
-static void broadcast_to_client(unsigned long);
+static void broadcast_to_client(FvwmPacket *);
 static void setup_signal_handlers(void);
 static RETSIGTYPE HandleTerminate(int sig);
 static int client_set_interest(struct client *, const char *);
+static bson_t *handle_packet(int, unsigned long *, unsigned long);
 
 static RETSIGTYPE
 HandleTerminate(int sig)
 {
+	unlink(SOCK);
 	fvwmSetTerminate(sig);
-	exit(0);
 	SIGNAL_RETURN;
 }
 
@@ -101,28 +108,46 @@ setup_signal_handlers(void)
 {
     struct sigaction  sigact;
 
+    memset(&sigact, 0, sizeof sigact);
+
     sigemptyset(&sigact.sa_mask);
     sigaddset(&sigact.sa_mask, SIGTERM);
     sigaddset(&sigact.sa_mask, SIGINT);
-    //sigaddset(&sigact.sa_mask, SIGPIPE);
-#ifdef SA_INTERRUPT
+    sigaddset(&sigact.sa_mask, SIGQUIT);
+    sigaddset(&sigact.sa_mask, SIGPIPE);
+    sigaddset(&sigact.sa_mask, SIGCHLD);
     sigact.sa_flags = SA_INTERRUPT; /* to interrupt ReadFvwmPacket() */
-#else
-    sigact.sa_flags = 0;
-#endif
     sigact.sa_handler = HandleTerminate;
 
     sigaction(SIGTERM, &sigact, NULL);
-    sigaction(SIGINT,  &sigact, NULL);
+    sigaction(SIGINT, &sigact, NULL);
     sigaction(SIGPIPE, &sigact, NULL);
-    signal(SIGTERM, HandleTerminate);
-    signal(SIGINT,  HandleTerminate);
-    signal(SIGPIPE, HandleTerminate);     /* Dead pipe == fvwm died */
-#ifdef HAVE_SIGINTERRUPT
-    siginterrupt(SIGTERM, True);
-    siginterrupt(SIGINT,  True);
-    siginterrupt(SIGPIPE, True);
-#endif
+    sigaction(SIGCHLD, &sigact, NULL);
+    sigaction(SIGQUIT, &sigact, NULL);
+}
+
+static bson_t *
+handle_packet(int type, unsigned long *body, unsigned long len)
+{
+	bson_t	*doc = NULL;
+
+	switch(type) {
+	case M_ADD_WINDOW:
+	case M_CONFIGURE_WINDOW: {
+		struct ConfigWinPacket *cwp = (void *)body;
+		doc = BCON_NEW(
+		    "w", BCON_INT64(cwp->w),
+		    "frame", BCON_INT64(cwp->frame),
+		    "frame_x", BCON_INT64(cwp->frame_x),
+		    "frame_y", BCON_INT64(cwp->frame_y)
+		);
+		return (doc);
+	}
+	default:
+		break;
+	}
+
+	return (NULL);
 }
 
 static inline const char *
@@ -203,18 +228,32 @@ client_set_interest(struct client *c, const char *event)
 }
 
 static void
-broadcast_to_client(unsigned long type)
+broadcast_to_client(FvwmPacket *packet)
 {
-	struct client	*c;
-	char 		*buf;
+	bson_t			*doc;
+	char			*as_json;
+	struct client		*c;
+	size_t			 json_len;
+	unsigned long		*body = packet->body;
+	unsigned long		 type =	packet->type;
+	unsigned long		 length = packet->size;
 
 	TAILQ_FOREACH(c, &clientq, entry) {
 		if (!(c->flags & type))
 			continue;
-		asprintf(&buf, "Reacting to: %s", flag_to_event(type));
 
-		bufferevent_write(c->comms, buf, strlen(buf));
-		free(buf);
+		if ((doc = handle_packet(type, body, length)) == NULL)
+			continue;
+
+		as_json = bson_as_relaxed_extended_json(doc, &json_len);
+		if (as_json == NULL) {
+			bson_free(as_json);
+			continue;
+		}
+
+		bufferevent_write(c->comms, as_json, strlen(as_json));
+		bson_free(as_json);
+		bson_destroy(doc);
 	}
 }
 
@@ -235,9 +274,8 @@ client_read_cb(struct bufferevent *bev, void *ctx)
 	if (*data == '\0')
 		goto out;
 
-	if (client_set_interest(c, data)) {
+	if (client_set_interest(c, data))
 		goto out;
-	}
 
 	SendText(fc.fd, data, 0);
 
@@ -300,16 +338,6 @@ static void accept_error_cb(struct evconnlistener *listener, void *ctx)
 }
 
 static void
-signal_cb(evutil_socket_t sig, short events, void *user_data)
-{
-	struct event_base *base = user_data;
-	struct timeval delay = { 1, 0 };
-
-	unlink(SOCK);
-	event_base_loopexit(base, &delay);
-}
-
-static void
 fvwm_read(int efd, short ev, void *data)
 {
 	FvwmPacket	*packet;
@@ -322,14 +350,13 @@ fvwm_read(int efd, short ev, void *data)
 		exit(0);
 	}
 
-	broadcast_to_client(packet->type);
+	broadcast_to_client(packet);
 }
 
 int main(int argc, char **argv)
 {
 	struct event_base     *base;
 	struct evconnlistener *fmd_cfd;
-	struct event          *signal_event;
 	struct sockaddr_un    sin;
 
 	TAILQ_INIT(&clientq);
@@ -347,8 +374,6 @@ int main(int argc, char **argv)
 		return (1);
 	}
 
-	unlink(SOCK);
-
 	memset(&sin, 0, sizeof(sin));
 	sin.sun_family = AF_LOCAL;
 	strcpy(sin.sun_path, SOCK);
@@ -362,12 +387,6 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	evconnlistener_set_error_cb(fmd_cfd, accept_error_cb);
-
-	signal_event = evsignal_new(base, SIGPIPE, signal_cb, (void *)base);
-	if (signal_event == NULL || event_add(signal_event, NULL) < 0) {
-		fprintf(stderr, "Could not create/add a signal event\n");
-		return (1);
-	}
 
 	/* Setup comms to fvwm3. */
 	fc.fd[0] = fc.m->to_fvwm;

@@ -529,7 +529,7 @@ AH_TEMPLATE([HAVE_LIBBSON],[Define if libbson is used.])
 PKG_CHECK_MODULES([libbson], [libbson-1.0],
 [
 	 AC_DEFINE(HAVE_LIBBSON)
-	libevent_LIBS=-lbson-1.0
+	libbson_LIBS=-lbson-1.0
 ],
 [
 	 AC_MSG_ERROR([*** libnson not found.  Install its header files. ***])
